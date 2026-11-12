@@ -4,7 +4,7 @@
  */
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { AlertTriangle, X
+import { AlertTriangle, CreditCard, X
 } from 'lucide-react';
 import { 
   StudentPaymentRecord, 
@@ -57,12 +57,15 @@ import {
 import { 
   calculateBalance, 
   calculateStatus, 
+  calculateScholarshipTuition,
   getTodayDateString,
   getClassFeeSchedule,
   deriveFeeBreakdown,
   buildCombinedReceipt,
   detectLessonPlanMonths,
   isLessonDisabled,
+  parseFinancialAmount,
+  roundMoney,
   setConfiguredAcademicSession,
   FEE_SCHEDULE
 
@@ -72,11 +75,13 @@ import { BottomNav } from './components/BottomNav';
 import { StudentList } from './components/StudentList';
 const RecordPaymentView = React.lazy(() => import('./components/RecordPaymentView').then((module) => ({ default: module.RecordPaymentView })));
 const AnalyticsView = React.lazy(() => import('./components/AnalyticsView').then((module) => ({ default: module.AnalyticsView })));
+const SchoolPaymentsDashboard = React.lazy(() => import('./components/SchoolPaymentsDashboard'));
 const CollectionView = React.lazy(() => import('./components/CollectionView').then((module) => ({ default: module.CollectionView })));
 import { BackupRolloverModal } from './components/BackupRolloverModal';
 import { EndTermModal } from './components/EndTermModal';
 import { StudentDetailsModal } from './components/StudentDetailsModal';
 import { AddExistingStudentModal } from './components/AddExistingStudentModal';
+import { EnrollmentTypeModal } from './components/EnrollmentTypeModal';
 import { ScholarshipModal } from './components/ScholarshipModal';
 const AdmissionView = React.lazy(() => import('./components/AdmissionView').then((module) => ({ default: module.AdmissionView })));
 import { SettingsModal } from './components/SettingsModal';
@@ -95,6 +100,7 @@ import {
   savePaymentTransaction,
   getLastFirestoreWriteError,
   batchSaveStudentsToFirestore,
+  reassignStudentsInFirestore,
   getStudentsFromFirestore,
   subscribeStudentsFromFirestore,
   deleteStudentFromFirestore,
@@ -223,6 +229,16 @@ export default function App() {
 
   // Data & Network States
   const [students, setStudents] = useState<StudentPaymentRecord[]>(() => getStoredStudents(activeSchoolId));
+  const [schoolStudentsCache, setSchoolStudentsCache] = useState<Record<string, StudentPaymentRecord[]>>({});
+  const schoolStudentsById = useMemo(() => {
+    const rosters: Record<string, StudentPaymentRecord[]> = {};
+    schools.forEach((school) => {
+      rosters[school.id] = school.id === activeSchool?.id
+        ? students
+        : schoolStudentsCache[school.id] ?? getStoredStudents(school.id);
+    });
+    return rosters;
+  }, [schools, activeSchool?.id, students, schoolStudentsCache]);
   // Keys of payment attempts whose save is not confirmed yet (see handleSubmitPayment)
   const pendingPaymentKeysRef = useRef<Map<string, { key: string; createdAt: number }>>(new Map());
   const [scholarships, setScholarships] = useState<ScholarshipRecord[]>(() => getStoredScholarships(activeSchoolId));
@@ -428,6 +444,29 @@ export default function App() {
     };
   }, [activeSchool?.id]);
 
+  useEffect(() => {
+    setSchoolStudentsCache((current) => (
+      current[activeSchool.id] === students
+        ? current
+        : { ...current, [activeSchool.id]: students }
+    ));
+  }, [activeSchool.id, students]);
+
+  useEffect(() => {
+    const otherSchools = schools.filter((school) => school.id !== activeSchool.id);
+    const unsubscribers = otherSchools.map((school) => subscribeStudentsFromFirestore(school.id, (liveStudents) => {
+      if (!Array.isArray(liveStudents)) return;
+      saveStoredStudents(liveStudents, school.id);
+      setSchoolStudentsCache((current) => ({ ...current, [school.id]: liveStudents }));
+    }));
+
+    return () => {
+      unsubscribers.forEach((unsubscribe) => {
+        if (unsubscribe) unsubscribe();
+      });
+    };
+  }, [schools, activeSchool.id]);
+
   const pendingRemittanceCount = useMemo(() => {
     return remittances.filter((r) => r.status === 'pending' || r.approvalStatus === 'pending').length;
   }, [remittances]);
@@ -435,15 +474,75 @@ export default function App() {
   // Modals & Interactive States
   const [selectedStudentForDetails, setSelectedStudentForDetails] = useState<StudentPaymentRecord | null>(null);
   const [studentForPayment, setStudentForPayment] = useState<StudentPaymentRecord | null>(null);
+  const [isRecordPaymentOpen, setIsRecordPaymentOpen] = useState(false);
+  const recordPaymentDialogRef = useRef<HTMLDivElement>(null);
+  const recordPaymentCloseButtonRef = useRef<HTMLButtonElement>(null);
+  const recordPaymentButtonRef = useRef<HTMLButtonElement>(null);
+  const isAdditionalFeesOpenRef = useRef(false);
+  const openRecordPayment = useCallback(() => setIsRecordPaymentOpen(true), []);
+  const closeRecordPayment = useCallback(() => {
+    setIsRecordPaymentOpen(false);
+    setStudentForPayment(null);
+  }, []);
+
+  useEffect(() => {
+    if (!isRecordPaymentOpen) return;
+
+    const dialog = recordPaymentDialogRef.current;
+    const previousActiveElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const previousBodyOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    recordPaymentCloseButtonRef.current?.focus();
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (isAdditionalFeesOpenRef.current) return;
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeRecordPayment();
+        return;
+      }
+      if (event.key !== 'Tab' || !dialog) return;
+
+      const focusable = Array.from(dialog.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      ));
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (!first || !last) return;
+
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.body.style.overflow = previousBodyOverflow;
+      document.removeEventListener('keydown', handleKeyDown);
+      if (previousActiveElement?.isConnected) previousActiveElement.focus();
+      else recordPaymentButtonRef.current?.focus();
+    };
+  }, [isRecordPaymentOpen, closeRecordPayment]);
   const [studentToGrantScholarship, setStudentToGrantScholarship] = useState<StudentPaymentRecord | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
-  const [isAddStudentOpen, setIsAddStudentOpen] = useState<boolean>(false);
+  const [enrollmentStep, setEnrollmentStep] = useState<'choose' | 'new' | 'existing' | null>(null);
+  const openEnrollmentChooser = () => {
+    setActiveTab('students');
+    setEnrollmentStep('choose');
+  };
   const [isScholarshipModalOpen, setIsScholarshipModalOpen] = useState<boolean>(false);
   const [isRolloverModalOpen, setIsRolloverModalOpen] = useState<boolean>(false);
   const [isEndTermOpen, setIsEndTermOpen] = useState<boolean>(false);
   const [isDuplicateCleanerOpen, setIsDuplicateCleanerOpen] = useState<boolean>(false);
   const [isSheetUploadOpen, setIsSheetUploadOpen] = useState<boolean>(false);
   const [isAdditionalFeesOpen, setIsAdditionalFeesOpen] = useState<boolean>(false);
+  useEffect(() => {
+    isAdditionalFeesOpenRef.current = isAdditionalFeesOpen;
+  }, [isAdditionalFeesOpen]);
   
   // School Modal state
   const [isSchoolModalOpen, setIsSchoolModalOpen] = useState<boolean>(false);
@@ -688,6 +787,129 @@ export default function App() {
       showToast(`Created & switched to ${created.name} dashboard!`);
     }
     setIsSchoolModalOpen(false);
+  };
+
+  const handleManageClasses = async (
+    updatedSchool: SchoolProfile,
+    reassignment?: { fromClass: string; toClass: string }
+  ): Promise<{ success: boolean; message?: string }> => {
+    const schoolId = updatedSchool.id;
+    const currentSchool = getStoredSchools().find((school) => school.id === schoolId);
+    const normalizeClassName = (value: string) => value.trim().replace(/\s+/g, ' ').toLocaleLowerCase();
+
+    if (!currentSchool || schoolId !== activeSchoolId) {
+      return { success: false, message: 'The active school changed. Reopen Class Manager before saving.' };
+    }
+
+    const cleanedClasses = (updatedSchool.classes || []).map((className) => className.trim().replace(/\s+/g, ' '));
+    if (cleanedClasses.some((className) => !className) || new Set(cleanedClasses.map(normalizeClassName)).size !== cleanedClasses.length) {
+      return { success: false, message: 'Class names must be non-empty and unique.' };
+    }
+
+    const localRoster = [...getStoredStudents(schoolId), ...students];
+    const rosterById = new Map<string, StudentPaymentRecord>();
+    localRoster.forEach((student) => {
+      if (student.id) rosterById.set(String(student.id), student);
+    });
+
+    let movedCount = 0;
+    if (reassignment) {
+      const sourceClass = normalizeClassName(reassignment.fromClass);
+      const targetClass = normalizeClassName(reassignment.toClass);
+      const currentClasses = currentSchool.classes || [];
+      if (
+        !sourceClass ||
+        !targetClass ||
+        sourceClass === targetClass ||
+        !currentClasses.some((className) => normalizeClassName(className) === sourceClass) ||
+        cleanedClasses.some((className) => normalizeClassName(className) === sourceClass) ||
+        !cleanedClasses.some((className) => normalizeClassName(className) === targetClass)
+      ) {
+        return { success: false, message: 'The source or destination class changed. No class was removed.' };
+      }
+
+      if (localRoster.some(
+        (student) => normalizeClassName(student.class || '') === sourceClass && !student.id
+      )) {
+        return { success: false, message: 'A student record is missing its ID. No class was removed; correct that record first.' };
+      }
+      const localStudentsToMove = Array.from(rosterById.values()).filter(
+        (student) => normalizeClassName(student.class || '') === sourceClass
+      );
+
+      const reassignmentResult = await reassignStudentsInFirestore(
+        reassignment.fromClass,
+        reassignment.toClass,
+        schoolId
+      );
+      if (!reassignmentResult.success) {
+        return {
+          success: false,
+          message: `Could not confirm all student updates. The original class is still configured. If some cloud writes completed, retrying will safely continue. ${reassignmentResult.error || ''}`.trim(),
+        };
+      }
+
+      const cloudStudentIds = new Set(reassignmentResult.firestoreStudentIds.map(String));
+      const localOnlyUpdates = localStudentsToMove
+        .filter((student) => !cloudStudentIds.has(String(student.id)))
+        .map((student) => ({ ...student, class: reassignment.toClass }));
+
+      if (localOnlyUpdates.length > 0) {
+        const localOnlySaved = await batchSaveStudentsToFirestore(localOnlyUpdates, schoolId);
+        if (!localOnlySaved) {
+          return {
+            success: false,
+            message: `Some cloud students may already be reassigned, but the class remains configured. Retry to finish saving the remaining records. ${getLastFirestoreWriteError() || ''}`.trim(),
+          };
+        }
+      }
+
+      const updatedRosterById = new Map<string, StudentPaymentRecord>();
+      rosterById.forEach((student, id) => {
+        updatedRosterById.set(
+          id,
+          normalizeClassName(student.class || '') === sourceClass
+            ? { ...student, class: reassignment.toClass }
+            : student
+        );
+      });
+      reassignmentResult.movedStudents.forEach((student) => {
+        const existing = updatedRosterById.get(String(student.id));
+        updatedRosterById.set(String(student.id), existing ? { ...existing, class: reassignment.toClass } : student);
+      });
+
+      const updatedRoster = Array.from(updatedRosterById.values());
+      movedCount = reassignmentResult.movedStudents.length + localOnlyUpdates.length;
+      saveStoredStudents(updatedRoster, schoolId);
+      setStudents(updatedRoster);
+    }
+
+    const profileToSave: SchoolProfile = {
+      ...currentSchool,
+      ...updatedSchool,
+      classes: cleanedClasses,
+      classFeeSchedules: updatedSchool.classFeeSchedules,
+    };
+    const profileSaved = await saveSchoolProfileToFirestore(profileToSave);
+    if (!profileSaved) {
+      return {
+        success: false,
+        message: reassignment
+          ? `Student records were saved to ${reassignment.toClass}, but the class list could not be saved. ${reassignment.fromClass} remains configured; retry the class change. ${getLastFirestoreWriteError() || ''}`.trim()
+          : `Class changes were not confirmed in Firestore, so the saved class list was left unchanged. ${getLastFirestoreWriteError() || ''}`.trim(),
+      };
+    }
+
+    const nextSchools = getStoredSchools().map((school) => (school.id === schoolId ? profileToSave : school));
+    saveStoredSchools(nextSchools);
+    setSchools(nextSchools);
+
+    return {
+      success: true,
+      message: reassignment
+        ? `${reassignment.fromClass} was safely moved to ${reassignment.toClass}; ${movedCount} student record${movedCount === 1 ? '' : 's'} confirmed.`
+        : 'Class changes saved to Firestore.',
+    };
   };
 
   // Update fee schedule across all enrolled students
@@ -1195,18 +1417,23 @@ export default function App() {
     const existingStudent = students.find((s) => s.id === scholarshipData.studentId);
     const targetClass = scholarshipData.studentClass || existingStudent?.class || 'Primary 1';
     const classSchedule = getClassFeeSchedule(activeSchool, targetClass);
-
-    // Live tuition resolution based on Settings
-    const baseTuition = classSchedule.tuitionFee;
-    const rawPct = Number(scholarshipData.scholarshipPercentage);
-    const pct = Number.isFinite(rawPct) ? Math.min(100, Math.max(0, rawPct)) : 100;
     const isExempt = scholarshipData.exemptSchoolFee !== false;
-    let tuitionFee = 0;
-    if (isExempt || pct >= 100) {
-      tuitionFee = 0;
-    } else {
-      tuitionFee = Math.round(baseTuition * (1 - pct / 100));
-    }
+    const tuitionCalculation = calculateScholarshipTuition(
+      classSchedule.tuitionFee,
+      scholarshipData.scholarshipPercentage,
+      isExempt
+    );
+    const pct = tuitionCalculation.scholarshipPercentage;
+    const tuitionFee = tuitionCalculation.tuitionFee;
+    const additionalFeeBreakdown = deriveFeeBreakdown(
+      existingStudent
+        ? { ...existingStudent, class: targetClass, term: scholarshipData.term || existingStudent.term }
+        : { class: targetClass, term: scholarshipData.term, is_new_admission: false },
+      activeSchool,
+      { forceScheduleRates: true }
+    );
+    const additionalFees = additionalFeeBreakdown.additionalFees;
+    const additionalFeesTotal = additionalFeeBreakdown.additionalFeesTotal;
 
     let updatedRecord: StudentPaymentRecord;
 
@@ -1220,20 +1447,20 @@ export default function App() {
       } else if (existingStudent.lesson_fee === 0 && Number(existingStudent.lesson_paid || 0) === 0) {
         lessonFee = 0;
       }
-      const lessonPaid = Number(existingStudent.lesson_paid || 0);
+      const lessonPaid = parseFinancialAmount(existingStudent.lesson_paid, 0);
       if (isLessonDisabled(existingStudent)) lessonFee = 0;
       lessonFee = Math.max(lessonFee, lessonPaid);
 
-      const examPaid = Number(existingStudent.exam_paid || 0);
+      const examPaid = parseFinancialAmount(existingStudent.exam_paid, 0);
       const examFee = Math.max(classSchedule.examFee, examPaid);
 
-      const admissionPaid = Number(existingStudent.admission_paid || 0);
+      const admissionPaid = parseFinancialAmount(existingStudent.admission_paid, 0);
       const admissionFee = existingStudent.is_new_admission
         ? classSchedule.admissionFee
-        : Math.max(Number(existingStudent.admission_fee || 0), admissionPaid);
+        : Math.max(parseFinancialAmount(existingStudent.admission_fee, 0), admissionPaid);
 
-      const totalFee = tuitionFee + admissionFee + lessonFee + examFee;
-      const amountPaid = Number(existingStudent.amount_paid || 0);
+      const totalFee = roundMoney(tuitionFee + admissionFee + lessonFee + examFee + additionalFeesTotal);
+      const amountPaid = parseFinancialAmount(existingStudent.amount_paid, 0);
       const balance = calculateBalance(totalFee, amountPaid);
       const status = calculateStatus(totalFee, amountPaid);
 
@@ -1243,12 +1470,13 @@ export default function App() {
         class: targetClass,
         term: scholarshipData.term || existingStudent.term,
         session: scholarshipData.session || existingStudent.session,
-        is_exempt_from_school_fee: tuitionFee === 0,
+        is_exempt_from_school_fee: isExempt || pct >= 100,
         scholarship_notes: scholarshipData.scholarshipNotes,
         tuition_fee: tuitionFee,
         lesson_fee: lessonFee,
         exam_fee: examFee,
         admission_fee: admissionFee,
+        additional_fees: additionalFees,
         fee_amount: totalFee,
         amount_paid: amountPaid,
         balance,
@@ -1265,7 +1493,7 @@ export default function App() {
       const lessonFee = classSchedule.lessonFeeTermly;
       const examFee = classSchedule.examFee;
       const admissionFee = 0;
-      const totalFee = tuitionFee + admissionFee + lessonFee + examFee;
+      const totalFee = roundMoney(tuitionFee + admissionFee + lessonFee + examFee + additionalFeesTotal);
       const balance = calculateBalance(totalFee, 0);
       const status = calculateStatus(totalFee, 0);
 
@@ -1280,7 +1508,7 @@ export default function App() {
         balance,
         status,
         payment_date: getTodayDateString(),
-        is_exempt_from_school_fee: tuitionFee === 0,
+        is_exempt_from_school_fee: isExempt || pct >= 100,
         scholarship_notes: scholarshipData.scholarshipNotes,
         tuition_fee: tuitionFee,
         tuition_paid: 0,
@@ -1290,6 +1518,7 @@ export default function App() {
         lesson_paid: 0,
         exam_fee: examFee,
         exam_paid: 0,
+        additional_fees: additionalFees,
         total_remitted: 0,
       };
 
@@ -1304,12 +1533,12 @@ export default function App() {
     const scholarshipRecordToStore: ScholarshipRecord = {
       id: scholarshipData.studentId,
       student_name: scholarshipData.fullName,
-      class: scholarshipData.studentClass,
-      term: scholarshipData.term,
-      session: scholarshipData.session,
+      class: targetClass,
+      term: updatedRecord.term,
+      session: updatedRecord.session,
       scholarship_type: scholarshipData.scholarshipType,
-      scholarship_percentage: scholarshipData.scholarshipPercentage,
-      exempt_school_fee: scholarshipData.exemptSchoolFee,
+      scholarship_percentage: pct,
+      exempt_school_fee: isExempt || pct >= 100,
       scholarship_notes: scholarshipData.scholarshipNotes,
       award_date: scholarshipData.awardDate,
       awarded_by: scholarshipData.awardedBy,
@@ -1545,18 +1774,20 @@ export default function App() {
     const typedReceipt = options?.receiptNumber?.trim() || '';
     const totalAmount = lines.reduce((sum, l) => sum + (Number(l.amount) || 0), 0);
 
-    // A typed receipt number must not belong to a different student.
+    // A typed receipt number must be unique across both the current student's history and the roster.
     if (typedReceipt) {
       const wanted = typedReceipt.toLowerCase();
-      const clash = students.find((s) => {
-        if (s.id === student.id) return false;
-        if ((s.receipt_no || '').trim().toLowerCase() === wanted) return true;
-        return Array.isArray(s.payment_history) &&
-          s.payment_history.some((h) => (h.receiptNumber || '').trim().toLowerCase() === wanted);
-      });
+      const clash = students.find((s) =>
+        (s.receipt_no || '').trim().toLowerCase() === wanted ||
+        (Array.isArray(s.payment_history) &&
+          s.payment_history.some((h) => (h.receiptNumber || '').trim().toLowerCase() === wanted))
+      );
       if (clash) {
+        const usedBy = clash.id === student.id
+          ? `an earlier payment for ${clash.full_name}`
+          : `${clash.full_name} (${clash.class})`;
         throw new Error(
-          `Receipt No. ${typedReceipt} is already used for ${clash.full_name} (${clash.class}). Enter a different receipt number.`
+          `Receipt No. ${typedReceipt} is already used for ${usedBy}. Enter a different receipt number.`
         );
       }
     }
@@ -1682,7 +1913,7 @@ export default function App() {
   const handleRecordPaymentForStudent = (student: StudentPaymentRecord) => {
     setSelectedStudentForDetails(null);
     setStudentForPayment(student);
-    setActiveTab('record_payment');
+    openRecordPayment();
   };
 
   // Handle Rollover completion
@@ -1773,7 +2004,7 @@ export default function App() {
           isLoading={isLoading}
           onRefresh={() => loadStudents(true)}
           onOpenSettings={() => setIsSettingsOpen(true)}
-          onOpenAddStudent={() => setIsAddStudentOpen(true)}
+          onOpenAddStudent={openEnrollmentChooser}
           onOpenSheetUpload={() => setIsSheetUploadOpen(true)}
           onLogout={handleLogout}
           studentCount={students.length}
@@ -1886,7 +2117,7 @@ export default function App() {
               </div>
             }
           >
-          {activeTab === 'students' && (
+          {activeTab === 'students' && enrollmentStep !== 'new' && (
             <StudentList
               students={students}
               isLoading={isLoading}
@@ -1894,9 +2125,11 @@ export default function App() {
               currencySymbol={session.currencySymbol}
               feeSchedule={activeSchool?.feeSchedule}
               activeSchool={activeSchool}
+              schools={schools}
+              studentsBySchool={schoolStudentsById}
               onRefresh={() => loadStudents(true)}
               onSelectStudent={(stu) => setSelectedStudentForDetails(stu)}
-              onOpenAddStudent={() => setIsAddStudentOpen(true)}
+              onOpenAddStudent={openEnrollmentChooser}
               onOpenScholarships={() => setIsScholarshipModalOpen(true)}
               onOpenSheetUpload={() => setIsSheetUploadOpen(true)}
               onOpenBackup={() => setIsRolloverModalOpen(true)}
@@ -1909,29 +2142,18 @@ export default function App() {
           )}
 
           {activeTab === 'record_payment' && (
-            <RecordPaymentView
-              students={students}
-              currencySymbol={session.currencySymbol}
-              preselectedStudent={studentForPayment}
-              onClearPreselectedStudent={() => setStudentForPayment(null)}
-              onSubmitPayment={handleSubmitPayment}
-              onViewStudentInList={(stu) => {
-                setSelectedStudentForDetails(stu);
-                setActiveTab('students');
-              }}
-              onOpenAddStudent={() => setIsAddStudentOpen(true)}
-              onOpenAdditionalFees={() => setIsAdditionalFeesOpen(true)}
-              activeSchool={activeSchool}
-            />
+            <SchoolPaymentsDashboard schools={schools} studentsBySchool={schoolStudentsById} />
           )}
 
-          {activeTab === 'admission' && (
+          {activeTab === 'students' && enrollmentStep === 'new' && (
             <AdmissionView
               currencySymbol={session.currencySymbol}
               existingCount={students.length}
               students={students}
               onAddStudent={handleAddStudent}
+              onBack={() => setEnrollmentStep('choose')}
               onViewStudent={(stu) => {
+                setEnrollmentStep(null);
                 setSelectedStudentForDetails(stu);
                 setActiveTab('students');
               }}
@@ -1967,7 +2189,7 @@ export default function App() {
               session={session}
               onUpdateStudents={setStudents}
               onSelectStudent={(stu) => setSelectedStudentForDetails(stu)}
-              onOpenRecordPayment={() => setActiveTab('record_payment')}
+              onOpenRecordPayment={openRecordPayment}
               remittances={remittances}
               onUpdateRemittances={setRemittances}
               school={activeSchool}
@@ -1980,6 +2202,7 @@ export default function App() {
         <BottomNav
           activeTab={activeTab}
           onTabChange={(tab) => {
+            setEnrollmentStep(null);
             setSelectedStudentForDetails(null);
             setActiveTab(tab);
             if (tab === 'students') {
@@ -1989,6 +2212,73 @@ export default function App() {
           studentCount={students.length}
           pendingRemittanceCount={pendingRemittanceCount}
         />
+
+        {enrollmentStep === null && (
+          <button
+            type="button"
+            onClick={openRecordPayment}
+            aria-haspopup="dialog"
+            aria-controls="record-payment-dialog"
+            ref={recordPaymentButtonRef}
+            className="absolute bottom-[calc(4.5rem+env(safe-area-inset-bottom))] right-4 z-40 inline-flex min-h-12 items-center gap-2 rounded-full bg-slate-950 px-4 text-xs font-black text-white shadow-xl shadow-slate-950/20 transition-transform hover:-translate-y-0.5 hover:bg-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 focus-visible:ring-offset-2 active:scale-[0.98] md:bottom-20 md:right-8"
+          >
+            <CreditCard className="size-4 text-emerald-300" aria-hidden="true" />
+            <span>Record payment</span>
+          </button>
+        )}
+
+        <div
+          ref={recordPaymentDialogRef}
+          id="record-payment-dialog"
+          role="dialog"
+          aria-modal={isRecordPaymentOpen && !isAdditionalFeesOpen}
+          aria-hidden={!isRecordPaymentOpen}
+          aria-labelledby="record-payment-dialog-title"
+          onClick={(event) => {
+            if (event.target === event.currentTarget) closeRecordPayment();
+          }}
+          className={`fixed inset-0 z-[60] items-stretch justify-center bg-slate-950/60 p-0 sm:items-center sm:p-4 ${isRecordPaymentOpen ? 'flex' : 'hidden'}`}
+        >
+          {isRecordPaymentOpen && (
+            <div className="mx-auto flex h-full max-h-full w-full max-w-3xl flex-col overflow-hidden bg-white shadow-2xl sm:max-h-[calc(100dvh-2rem)] sm:rounded-3xl">
+              <header className="flex shrink-0 items-center justify-between gap-3 border-b border-slate-200 bg-white px-4 py-3 sm:px-6">
+                <div className="min-w-0">
+                  <h2 id="record-payment-dialog-title" className="text-sm font-black text-slate-950">Record payment</h2>
+                  <p className="truncate text-[11px] text-slate-500">{activeSchool.name}</p>
+                </div>
+                <button
+                  type="button"
+                  ref={recordPaymentCloseButtonRef}
+                  onClick={closeRecordPayment}
+                  aria-label="Close record payment"
+                  className="grid size-10 shrink-0 place-items-center rounded-xl border border-slate-200 text-slate-600 transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500"
+                >
+                  <X className="size-4" aria-hidden="true" />
+                </button>
+              </header>
+              <div className="min-h-0 flex-1 overflow-y-auto">
+                <RecordPaymentView
+                  students={students}
+                  currencySymbol={session.currencySymbol}
+                  preselectedStudent={studentForPayment}
+                  onClearPreselectedStudent={() => setStudentForPayment(null)}
+                  onSubmitPayment={handleSubmitPayment}
+                  onViewStudentInList={(student) => {
+                    closeRecordPayment();
+                    setSelectedStudentForDetails(student);
+                    setActiveTab('students');
+                  }}
+                  onOpenAddStudent={() => {
+                    closeRecordPayment();
+                    openEnrollmentChooser();
+                  }}
+                  onOpenAdditionalFees={() => setIsAdditionalFeesOpen(true)}
+                  activeSchool={activeSchool}
+                />
+              </div>
+            </div>
+          )}
+        </div>
 
         {/* Student Full Details Modal with Confirmation */}
         <StudentDetailsModal
@@ -2010,10 +2300,16 @@ export default function App() {
           onOpenAdditionalFees={() => setIsAdditionalFeesOpen(true)}
         />
 
-        {/* Add Existing Student Modal */}
+        <EnrollmentTypeModal
+          isOpen={enrollmentStep === 'choose'}
+          onClose={() => setEnrollmentStep(null)}
+          onChoose={setEnrollmentStep}
+        />
+
+        {/* Existing-student enrollment */}
         <AddExistingStudentModal
-          isOpen={isAddStudentOpen}
-          onClose={() => setIsAddStudentOpen(false)}
+          isOpen={enrollmentStep === 'existing'}
+          onClose={() => setEnrollmentStep(null)}
           currencySymbol={session.currencySymbol}
           existingCount={students.length}
           students={students}
@@ -2036,8 +2332,9 @@ export default function App() {
           onSaveSchool={handleSaveSchool}
           onUpdateStudentsFee={handleUpdateStudentsFee}
           onUpdateSchoolFromFees={handleUpdateSchoolFromFees}
-          onUpdateStudentsFromFees={handleUpdateStudentsFromFees}
-          onSaveConfig={handleSaveApiConfig}
+  onUpdateStudentsFromFees={handleUpdateStudentsFromFees}
+  onManageClasses={handleManageClasses}
+  onSaveConfig={handleSaveApiConfig}
           onSaveSession={handleSaveSession}
           onOpenEndTerm={() => setIsEndTermOpen(true)}
           onOpenRollover={() => setIsRolloverModalOpen(true)}
